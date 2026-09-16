@@ -183,7 +183,7 @@ class LraTileAssignmentTransposedMFMA(LraTileAssignment):
             dividedForBlkId  = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (tile01 == 0) else kernel["MatrixInstN"]
 
         dividedForWaveId = waveWidth if (tile01 == 0) else (waveWidth * kernel["MIWaveGroup"][0])
-        vectorWidth      = kernel["VectorWidth%s"%tc]
+        vectorWidth      = 1 if tP["enableLDSTr"] else kernel["VectorWidth%s"%tc]
         maxKId = waveWidth // ((matrixInstT if (tile01 == 0) else kernel["MatrixInstN"]) * kernel["MatrixInstB"])
         writer.states.lraTileProperties[tile01] = LraTilePropertiesMFMA(dividendForKId=dividendForKId, \
                                                                         num1DBlocks=num1DBlocks, \
@@ -197,7 +197,13 @@ class LraTileAssignmentTransposedMFMA(LraTileAssignment):
         mt           = kernel["MacroTile%u" % tile01]
         strideTile   = int(int(tP["localReadInstruction"].blockWidth * writer.states.bpr) // tP["bpeDS"])
         strideUnroll = mt + ldsPad
-        strideWave   = numTileInInst * matrixInstT * vectorWidth
+        # The wave offset keeps the real VectorWidth even though `vectorWidth` above is
+        # clamped to 1 for the tile offset. ds_read_tr forces the *tile* stride to the VW=1
+        # geometry, but the store still places wave w at M row VW*MI*w, so the read has to
+        # agree or the wave reads rows it does not own (the epilogue shuffle,
+        # accumShuffleForLDSTrVW, only reorders within a wave). With MIWaveGroup[tile01] == 1
+        # this offset is multiplied by zero and nothing changes.
+        strideWave   = numTileInInst * matrixInstT * kernel["VectorWidth%s"%tc]
 
         with writer.allocTmpSgpr(1, tag="LraTileAssignmentTransposedMFMA_tmpSgprInfo") as tmpSgprInfo:
             # tile offset = (wtId%16)//8*8
@@ -334,7 +340,7 @@ class LraTileAssignmentTransposedMFMAB8(LraTileAssignmentTransposedMFMA):
             dividedForBlkId  = (kernel["MatrixInstN"] * kernel["MatrixInstBN"]) if (tile01 == 0) else kernel["MatrixInstN"]
 
         dividedForWaveId = waveWidth if (tile01 == 0) else (waveWidth * kernel["MIWaveGroup"][0])
-        vectorWidth      = kernel["VectorWidth%s"%tc]
+        vectorWidth      = 1 if tP["enableLDSTr"] else kernel["VectorWidth%s"%tc]
         maxKId = waveWidth // ((matrixInstT if (tile01 == 0) else kernel["MatrixInstN"]) * kernel["MatrixInstB"])
         writer.states.lraTileProperties[tile01] = LraTilePropertiesMFMA(dividendForKId=dividendForKId, \
                                                                         num1DBlocks=num1DBlocks, \
@@ -348,7 +354,13 @@ class LraTileAssignmentTransposedMFMAB8(LraTileAssignmentTransposedMFMA):
         mt           = kernel["MacroTile%u" % tile01]
         strideTile   = int(int(tP["localReadInstruction"].blockWidth * writer.states.bpr) // tP["bpeDS"])
         strideUnroll = mt + ldsPad
-        strideWave   = numTileInInst * matrixInstT * vectorWidth
+        # The wave offset keeps the real VectorWidth even though `vectorWidth` above is
+        # clamped to 1 for the tile offset. ds_read_tr forces the *tile* stride to the VW=1
+        # geometry, but the store still places wave w at M row VW*MI*w, so the read has to
+        # agree or the wave reads rows it does not own (the epilogue shuffle,
+        # accumShuffleForLDSTrVW, only reorders within a wave). With MIWaveGroup[tile01] == 1
+        # this offset is multiplied by zero and nothing changes.
+        strideWave   = numTileInInst * matrixInstT * kernel["VectorWidth%s"%tc]
 
         with writer.allocTmpSgpr(1, tag="LraTileAssignmentTransposedMFMAB8_tmpSgprInfo") as tmpSgprInfo:
             # tile offset = (wtId%8)//4*8
@@ -803,7 +815,7 @@ class LraTileAssignmentMFMA(LraTileAssignment):
         else:
             dividedForBlkId  = (matrixInstTO * kernel["MatrixInstBN"]) if (tile01 == 0) else matrixInstTO
         dividedForWaveId = waveWidth if (tile01 == 0) else (waveWidth * kernel["MIWaveGroup"][0])
-        vectorWidth      = kernel["VectorWidth%s"%tc]
+        vectorWidth      = 1 if enableLDSTr else kernel["VectorWidth%s"%tc]
         if isDTVAB:
             if tP["tlu"]:
                 # DTV + TLU case, glvw and vw are applied to the same direction. No need to apply both.
