@@ -79,6 +79,8 @@ def getRequiredParametersMin() -> set:
         'LdsPadMXSB',
         'LDSSegmentInterleave',
         'LDSTrInst',
+        'LDSTrInstA',
+        'LDSTrInstB',        
         'LocalReadVectorWidth',
         'LocalWritePerMfma',
         'MIArchVgpr',
