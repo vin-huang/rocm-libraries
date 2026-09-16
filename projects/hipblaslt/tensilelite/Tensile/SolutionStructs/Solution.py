@@ -2504,9 +2504,9 @@ class Solution(collections.abc.Mapping):
         if state["ProblemType"]["Sparse"]:
           # sparse gfx1250: Currently disable autoVectorWidthA. VectorWidthA still can be set manually in yaml file.
           # if isaInfoMap[isa].asmCaps["HasSWMMAC_gfx1250"] and state["ProblemType"]["Sparse"] == 1:
-          #   state["VectorWidthA"] = max(findSparseVectorWidth(2, state["VectorWidthA"]), 1)
+          state["VectorWidthA"] = max(findSparseVectorWidth(2, state["VectorWidthA"]), 1)
           # else:
-          state["VectorWidthA"] = 1
+          #state["VectorWidthA"] = 1
       else:
         state["VectorWidthA"] = 1
 
@@ -2523,9 +2523,9 @@ class Solution(collections.abc.Mapping):
         if state["ProblemType"]["Sparse"]:
           # sparse gfx1250: Currently disable autoVectorWidthB. VectorWidthB still can be set manually in yaml file.
           # if isaInfoMap[isa].asmCaps["HasSWMMAC_gfx1250"] and state["ProblemType"]["Sparse"] == 2:
-          #   state["VectorWidthB"] = max(findSparseVectorWidth(2, state["VectorWidthB"]), 1)
+          state["VectorWidthB"] = max(findSparseVectorWidth(2, state["VectorWidthB"]), 1)
           # else:
-          state["VectorWidthB"] = 1
+          #state["VectorWidthB"] = 1
       else:
         state["VectorWidthB"] = 1
 
@@ -2580,7 +2580,9 @@ class Solution(collections.abc.Mapping):
         or (numBytesB == 2 and isaInfoMap[isa].asmCaps["HasGLTr16B128"]) \
       )
 	  
-    if state["enableLDSTrA"] or state["enableGLTrA"]:
+    # enableGLTr still requires VW == 1: global_load_tr has a fixed lane->tile mapping
+    # and the DirectToVgpr read path has no VectorWidth handling at all.
+    if state["enableGLTrA"]:
       state["VectorWidthA"] = 1
 
     if state["enableLDSTrB"] or state["enableGLTrB"]:
@@ -2696,6 +2698,59 @@ class Solution(collections.abc.Mapping):
         state["VectorWidthMetadata"] = state["VectorWidthA"] if state["ProblemType"]["Sparse"] == 1 else state["VectorWidthB"]
       # ON/OFF the sourceswap according to the sparse type automatically
       state["SourceSwap"] = False if state["ProblemType"]["Sparse"] == 1 else True
+
+    # ds_read_tr hands lane L the tile row (m_base + L), so the A read is laid out VW=1 in
+    # the tile direction whatever VectorWidthA is (see mTileOffset in Components/LocalRead.py).
+    # VectorWidthA runs along M, which is contiguous in C/D, so VWA > 1 still pays for itself:
+    # the accumulators are shuffled from the read's VW=1 row order into the store's
+    # VW-interleaved order once in the epilogue (accumShuffleForLDSTrVW in KernelWriterAssembly).
+    # The shuffle handles VectorWidthA 2, 4 and 8 and any MIWaveTile[0] that is a multiple of
+    # it; its cost grows as VW*VW per group of VW tiles, so the wider settings want a
+    # benchmark before use. Placed after the sparse block above because SourceSwap is not
+    # final until then.
+    if state["enableLDSTrA"] and state["VectorWidthA"] > 1:
+      vwA = state["VectorWidthA"]
+      if vwA not in (2, 4, 8):
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA=%u: only 1, 2, 4 and 8 are implemented" % vwA)
+        return
+      if vwA > state["MatrixInstM"]:
+        # lane = ((L << log2VW) & (MI-1)) | s needs the VW slots to fit inside one MI lane group.
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA(%u) > MatrixInstM(%u)" % (vwA, state["MatrixInstM"]))
+        return
+      if state["MIWaveTile"][0] % vwA != 0:
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA=%u requires MIWaveTile[0](%u) to be a multiple " \
+            "of VectorWidthA" % (vwA, state["MIWaveTile"][0]))
+        return
+      # MIWaveGroup[0] > 1 is supported: the wave offset keeps the real VectorWidth
+      # (strideWave in Components/LraTileAssignment.py) and the tile offset splits into
+      # group/tile-in-group (mTileOffset in Components/LocalRead.py), so each wave still owns
+      # exactly the VW*MatrixInstM rows the store assigns it and the shuffle stays within the
+      # wave. MatrixInstBM > 1 has not been derived.
+      if state["MatrixInstBM"] != 1:
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA>1 requires MatrixInstBM(%u) == 1" \
+            % state["MatrixInstBM"])
+        return
+      if not state["SourceSwap"]:
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA>1 requires SourceSwap (the store path takes " \
+            "vectorWidth0 = VectorWidthA only in SourceSwap mode)")
+        return
+      if state["LocalSplitU"] > 1:
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA>1 does not support LocalSplitU>1 (LSU reduces " \
+            "through LDS with its own element layout)")
+        return
+      if state["WavefrontSize"] != 32:
+        # The shuffle's ds_bpermute addressing assumes one N group per MI_M lanes within a
+        # 32-lane wave; wave64 has not been derived or validated.
+        reject(state, printRejectionReason, \
+            "enableLDSTrA with VectorWidthA>1 is only implemented for WavefrontSize 32 (got %u)" \
+            % state["WavefrontSize"])
+        return
 
     # The real value of "1LDSBuffer" will be determined later (when it is -1), not here
 
@@ -4879,11 +4934,7 @@ class Solution(collections.abc.Mapping):
     state["enableLDSTrMetadata"] = isaInfoMap[isa].asmCaps["HasLDSTrB64B8"] and state["ProblemType"]["MetadataLayout"]
     if state["enableLDSTrMetadata"]:
       state["VectorWidthMetadata"] = 1
-
-      # the VetorWidth of the sparse matrix and metadta need to be the same.
-      if state["ProblemType"]["Sparse"] == 1:
-        state["VectorWidthA"] = 1
-      else:
+      if state["ProblemType"]["Sparse"] == 2:
         state["VectorWidthB"] = 1
 
     wmmaV3 = isaInfoMap[isa].asmCaps["HasWMMA_V3"]
