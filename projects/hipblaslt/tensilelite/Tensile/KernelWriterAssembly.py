@@ -8338,6 +8338,213 @@ class KernelWriterAssembly(KernelWriter):
     return module
 
   ##############################################################################
+  # Accumulator M-order shuffle for enableLDSTr with VectorWidth > 1
+  ##############################################################################
+  def accumShuffleForLDSTrVW(self, kernel):
+    """Re-order the accumulators' M direction from the local read's layout to the store's.
+
+    ds_read_tr hands lane L the tile row (m_base + L): a transpose group reads
+    NUM_CONT_READ_ELEMENTS *contiguous* rows and every lane in the group shares one
+    m_base, so the lane->row stride is locked at 1 and the A local read is always laid
+    out VW=1 in the tile direction (see mTileOffset in Components/LocalRead.py).
+
+    The store disagrees. It takes vectorWidth0 = VectorWidthA
+    (Components/NotLocalFullTileElements.py) and coord0 = VectorWidthA * (wave_id0 + tid0),
+    grouping VW consecutive wave tiles into one wide store, which needs each lane to own
+    VW *consecutive* M rows.
+
+    This bridges the two, once, in the epilogue. With MI = MatrixInstM, l = L % MI,
+    T = MIWaveTile[0] wave tiles and VW = VectorWidthA (T % VW == 0):
+
+        after MFMA   read tile t, lane l  ->  M row MI*t + l
+        after this   store tile t', lane l ->  M row MI*VW*(t'//VW) + VW*l + (t'%VW)
+
+    Both index the same MI*T rows, so per group of VW tiles this is exactly a
+    VW x MI transpose spread over (VW registers) x (MI lanes). Groups are independent:
+    group g covers M rows [MI*VW*g, MI*VW*(g+1)), which is exactly read tiles
+    VW*g .. VW*g+VW-1.
+
+    For destination slot s in a group, the source lane and source register are
+
+        lane = ((L << log2VW) & (MI-1)) | s          -- one address, reused for all VW sources
+        reg  = (L % MI) >> (log2MI - log2VW)         -- bits [log2MI-1 : log2MI-log2VW] of L
+
+    The register select depends on the *destination* lane, so it has to happen after the
+    gather: VW ds_bpermute then a log2VW-deep cndmask tree. Cost per group of VW tiles is
+    VW*VW ds_bpermute + VW*(VW-1) cndmask, i.e. quadratic in VW -- 96 ops at VW=2,
+    448 at VW=4, 1920 at VW=8 for MIWaveTile[1]=2. Worth checking against the stores it
+    saves before enabling the wider settings.
+
+    Requires MatrixInstBM == 1 and WavefrontSize 32; enforced in SolutionStructs/Solution.py.
+    MIWaveGroup[0] > 1 IS supported: strideWave (Components/LraTileAssignment.py) keeps the
+    real VectorWidth, so each wave owns exactly the VW*MatrixInstM rows the store assigns it
+    and the transpose never has to cross a wave boundary.
+
+    Triggered by, in yaml terms:
+        LDSTrInst: True            -> enableLDSTrA
+        VectorWidthA: 2 | 4 | 8    -> the shuffle is a no-op at 1
+        SourceSwap: 1              -> implied by Sparse: 2
+        StoreRemapVectorWidth: 0   -> storeRemap is the alternative bridge, not a companion
+    plus WavefrontSize 32, MatrixInstBM 1, LocalSplitU 1, and MIWaveTile[0] % VectorWidthA == 0.
+    Each of these is rejected with a specific reason in SolutionStructs/Solution.py, so a yaml
+    that asks for the shuffle and does not get it reports why.
+
+    The walk is numNTiles*numGroups*accPerTile mutually independent passes. AccumShufflePipe
+    picks how they are scheduled against each other: 0 drains LDS between every pass, 1 issues
+    the next pass's gather first and waits on a staggered dscnt so the LDS latency hides behind
+    the previous pass's cndmask tree. Both emit the same instruction multiset; which one is
+    faster depends on the configuration, so it is a tuning knob rather than a derived value.
+    """
+    module = Module("accumShuffleForLDSTrVW")
+    VW = kernel["VectorWidthA"]
+    # storeRemap is the other way of bridging the two M orders: it stages the accumulators
+    # through LDS and reads them back in store order, which subsumes this shuffle. Running
+    # both would apply the permutation twice. Unreachable today -- Solution.py rejects
+    # VectorWidth > 1 together with StoreRemap -- so this is a guard, not a live path.
+    if not (kernel.get("enableLDSTrA", False) and VW > 1) or kernel["StoreRemapVectorWidth"] > 0:
+      return module
+
+    miM     = kernel["MatrixInstM"]
+    log2VW  = log2(VW)
+    log2MI  = log2(miM)
+    # accumulator vgprs per (M tile, N tile) pair; mfma emits them as [nTile][mTile][acc].
+    accPerTile = miM * kernel["MatrixInstN"] // kernel["WavefrontSize"]
+    numMTiles  = kernel["MIWaveTile"][0]
+    numNTiles  = kernel["MIWaveTile"][1] * kernel["MatrixInstBN"]
+    numGroups  = numMTiles // VW
+
+    module.addComment1("LDSTr VW=%u: transpose accumulator M order for the wide store " \
+                       "(%u x %u per group)" % (VW, VW, miM))
+
+    vAddr = self.vgprPool.checkOut(1, "accShuffleAddr")
+    vTmp  = self.vgprPool.checkOut(1, "accShuffleTmp")
+
+    # addr = 4 * ( MI*(L//MI) + ((L << log2VW) & (MI-1)) ); slot s adds 4*s as an immediate.
+    # The MI*(L//MI) term keeps every gather inside the lane's own N group.
+    module.add(VLShiftRightB32(dst=vgpr(vAddr), shiftHex=hex(log2MI), src=vgpr("Serial"), \
+        comment="accShuffle: N group = Serial // MI_M(%u)" % miM))
+    module.add(VLShiftLeftB32(dst=vgpr(vAddr), shiftHex=hex(log2MI + 2), src=vgpr(vAddr), \
+        comment="accShuffle: N group base byte addr"))
+    module.add(VLShiftLeftB32(dst=vgpr(vTmp), shiftHex=hex(log2VW), src=vgpr("Serial"), \
+        comment="accShuffle: Serial * VW(%u)" % VW))
+    module.add(VAndB32(dst=vgpr(vTmp), src0=hex(miM - 1), src1=vgpr(vTmp), \
+        comment="accShuffle: wrap into the MI_M(%u) lane group" % miM))
+    module.add(VLShiftLeftB32(dst=vgpr(vTmp), shiftHex=hex(2), src=vgpr(vTmp), \
+        comment="accShuffle: scale source lane to a byte addr"))
+    module.add(VAddU32(dst=vgpr(vAddr), src0=vgpr(vTmp), src1=vgpr(vAddr), \
+        comment="accShuffle: gather addr for slot 0"))
+
+    laneCnt = self.states.laneSGPRCount
+    with self.allocTmpSgpr(laneCnt * log2VW, tag="accShuffleMask") as maskSgpr:
+      # Bit b of the source-register index is bit (log2MI - log2VW + b) of Serial.
+      # Mask is set when that bit is ZERO, i.e. when the lower element of the pair wins.
+      for b in range(log2VW):
+        bit = 1 << (log2MI - log2VW + b)
+        module.add(VAndB32(dst=vgpr(vTmp), src0=hex(bit), src1=vgpr("Serial"), \
+            comment="accShuffle: source-register index bit %u" % b))
+        module.add(VCmpEQU32(dst=sgpr(maskSgpr.idx + laneCnt * b, laneCnt), src0=vgpr(vTmp), src1=hex(0), \
+            comment="accShuffle: bit %u clear -> take the lower source register" % b))
+
+      # Every destination tile of a group reads *all* VW source tiles of that group, so no
+      # accumulator may be overwritten until the whole group is resolved. Results are parked
+      # in `res` and committed once per group. Slots are batched inside the group so several
+      # LDS round trips are in flight per s_waitcnt, bounded by the temp vgpr budget.
+      TMP_BUDGET = 16
+      slotBatch = min(VW, max(1, (TMP_BUDGET - VW) // VW))
+      res  = [self.vgprPool.checkOut(1, "accShuffleRes%u"%t)  for t in range(VW)]
+      gat  = [self.vgprPool.checkOut(1, "accShuffleGat%u"%t)  for t in range(VW * slotBatch)]
+      # AccumShufflePipe=1 needs a second gather buffer so pass p+1's ds_bpermute can be in
+      # flight while pass p's cndmask tree still reads pass p's results. Costs VW*slotBatch
+      # extra vgprs while ValuC is fully live. Whether that is free depends on how much the
+      # pool has left at endSummation, which varies with MacroTile -- check for spills.
+      pipelined = kernel.get("AccumShufflePipe", 0) > 0
+      gatB = [self.vgprPool.checkOut(1, "accShuffleGatB%u"%t) for t in range(VW * slotBatch)] \
+             if pipelined else []
+
+      def accIdx(n, mTile, i):
+        return n * numMTiles * accPerTile + mTile * accPerTile + i
+
+      # One pass = one chunk of slots of one (n, g, i). Passes are emitted back to back and are
+      # mutually independent: distinct (n, g, i) touch disjoint accumulators, and the chunks of
+      # one (n, g, i) only share read-only source registers.
+      passes = []
+      for n in range(numNTiles):
+        for g in range(numGroups):
+          for i in range(accPerTile):
+            for chunk in range(0, VW, slotBatch):
+              passes.append((n, g, i, list(range(chunk, min(chunk + slotBatch, VW)))))
+
+      def issueGather(buf, p):
+        n, g, i, slots = p
+        srcRegs = [accIdx(n, VW * g + j, i) for j in range(VW)]
+        for b, s in enumerate(slots):
+          for j in range(VW):
+            module.add(DSBPermuteB32(dst=vgpr(buf[VW*b + j]), src0=vgpr(vAddr), \
+                src1=vgpr("ValuC+%u"%srcRegs[j]), ds=DSModifiers(offset=4 * s), \
+                comment="accShuffle: grp%u slot%u <- read tile %u (acc %u)" \
+                        % (g, s, VW*g+j, srcRegs[j])))
+
+      def consume(buf, p):
+        n, g, i, slots = p
+        for b, s in enumerate(slots):
+          # cndmask tree: fold the VW candidates down by the source-register index.
+          width = VW
+          for lvl in range(log2VW):
+            mask = sgpr(maskSgpr.idx + laneCnt * lvl, laneCnt)
+            for k in range(width // 2):
+              lo, hi = buf[VW*b + 2*k], buf[VW*b + 2*k + 1]
+              last = (width // 2 == 1)
+              dstV = vgpr(res[s]) if last else vgpr(buf[VW*b + k])
+              module.add(VCndMaskB32(dst=dstV, src0=vgpr(hi), src1=vgpr(lo), src2=mask, \
+                  comment="accShuffle: select by source-register bit %u%s" \
+                          % (lvl, " -> slot %u" % s if last else "")))
+            width //= 2
+        # Commit once the group's last slot chunk is resolved -- `res` holds all VW slots by then.
+        if slots[-1] == VW - 1:
+          for s in range(VW):
+            dst = accIdx(n, VW * g + s, i)
+            module.add(VMovB32(dst=vgpr("ValuC+%u"%dst), src=vgpr(res[s]), \
+                comment="accShuffle: acc %u -> M row MI*VW*%u + VW*l + %u" % (dst, g, s)))
+
+      if not pipelined:
+        for p in passes:
+          issueGather(gat, p)
+          module.add(SWaitCnt(dscnt=0, comment="accShuffle: wait for ds_bpermute"))
+          consume(gat, p)
+      else:
+        # Issue-ahead. Pass p+1's ds_bpermute go out before pass p is consumed and the wait
+        # leaves exactly pass p+1's gathers outstanding, so pass p+1's LDS latency hides behind
+        # pass p's cndmask tree (and, on the last chunk of a group, behind the VW commits too).
+        #
+        # WAR: the commits write ValuC while ds_bpermute that source ValuC are outstanding.
+        # s_wait_dscnt does NOT cover this -- it gates the DS *result*, not the operand read.
+        # The source read is gated by s_wait_alu depctr_vm_vsrc, which the rocisa hazard pass
+        # inserts, and it is what makes this safe: as emitted here a commit is only reachable
+        # after its own group's gathers are consumed, but the scheduler does hoist commits
+        # above the next pass's gather issue, so the emission order alone is not the argument.
+        # Checked on the generated gfx1250 asm by replaying the DS queue against both
+        # s_wait_dscnt and depctr_vm_vsrc: no ValuC commit lands with an in-flight bpermute
+        # still holding that register unread. Re-check if the hazard pass changes.
+        bufs = [gat, gatB]
+        issueGather(bufs[0], passes[0])
+        for idx, p in enumerate(passes):
+          if idx + 1 < len(passes):
+            nxt = passes[idx + 1]
+            issueGather(bufs[(idx + 1) % 2], nxt)
+            waitN = VW * len(nxt[3])
+            module.add(SWaitCnt(dscnt=waitN, \
+                comment="accShuffle: wait pass %u (leave %u ds outstanding)" % (idx, waitN)))
+          else:
+            module.add(SWaitCnt(dscnt=0, comment="accShuffle: wait final pass"))
+          consume(bufs[idx % 2], p)
+
+      for t in gat + gatB + res:
+        self.vgprPool.checkIn(t)
+
+    self.vgprPool.checkIn(vTmp)
+    self.vgprPool.checkIn(vAddr)
+    return module
+  ##############################################################################
   # End Summation
   ##############################################################################
   def endSummation(self, kernel, tPA, tPB, noSkipLoad = True, label = None, isOptNLL = False):
@@ -8372,6 +8579,11 @@ class KernelWriterAssembly(KernelWriter):
       self.vgprPool.add(vbegin, vsize, "free vgpr of biasSumUnroll")
       module.addComment0("endSummation: add vgpr [%u...%u) to pool" % \
                         (vbegin, vbegin+vsize))
+
+    # Bridge the LDSTr local read's VW=1 M order to the store's VW-interleaved M order.
+    # Must run before any consumer of ValuC -- ShiftVectorComponents, computeStoreVgprs and
+    # the global write all follow this call -- and while the sgpr pool is still intact.
+    module.add(self.accumShuffleForLDSTrVW(kernel))
 
     keptSgprs = []
     # FP32 to FP8 SR without v_prng_b32 needs RNDSeed sgpr preserved

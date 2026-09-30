@@ -1014,6 +1014,20 @@ validParameters = { # we need to make sure this matches develop
     # -1 means set vw to largest localReadWidth according to MIWaveTile, LDS padding and LDS capacity
     "VectorWidthA": [-1, 1, 2, 3, 4, 6, 8],
     "VectorWidthB": [-1, 1, 2, 3, 4, 6, 8],
+    # AccumShufflePipe: software-pipeline the epilogue accumulator shuffle that bridges the
+    # ds_read_tr M order to the wide store's (accumShuffleForLDSTrVW in KernelWriterAssembly).
+    # The shuffle walks numNTiles*numGroups*accPerTile mutually independent passes, each
+    # VW*slotBatch ds_bpermute followed by a cndmask tree.
+    # 0 = drain LDS (s_wait_dscnt 0) at every pass, exposing the full bpermute latency once per
+    #     pass. This is the pre-pipeline behaviour and is emitted byte-identically.
+    # 1 = issue the next pass's ds_bpermute before consuming the current one and wait on a
+    #     staggered dscnt, so each pass's LDS latency hides behind the previous pass's cndmask
+    #     tree. Costs a second gather buffer (VW*slotBatch extra vgprs).
+    # Which one wins depends on the whole configuration and is not predictable from
+    # VectorWidthA, MacroTile or slotBatch alone -- benchmark both. Hence a tuning knob rather
+    # than a derived value. Only active when the shuffle itself is (enableLDSTrA and
+    # VectorWidthA > 1 and StoreRemapVectorWidth == 0); forced to 0 otherwise.
+    "AccumShufflePipe": [0, 1],
     # If 0, store 1 element per instruction.
     # If 1, store vector-width elements per instruction.
     # if -1, store vector-wide elements per instruction unless PBD would not generate a valid kernel
